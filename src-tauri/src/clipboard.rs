@@ -1,11 +1,13 @@
 use crate::input::{self, EnigoState};
 use crate::settings::{get_settings, ClipboardHandling, PasteMethod};
 use enigo::Enigo;
-use log::info;
+use log::{info, warn};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+#[cfg(target_os = "linux")]
+use crate::remote_desktop;
 #[cfg(target_os = "linux")]
 use crate::utils::{is_kde_wayland, is_wayland};
 #[cfg(target_os = "linux")]
@@ -121,13 +123,18 @@ fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> 
 #[cfg(target_os = "linux")]
 fn try_direct_typing_linux(text: &str) -> Result<bool, String> {
     if is_wayland() {
+        // Wayland: prefer remote_desktop, then wtype, then dotool, then ydotool
+        if is_remote_desktop_available() {
+            info!("Using Remote Desktop portal for direct text input");
+            type_text_via_remote_desktop(text)?;
+            return Ok(true);
+        }
         // KDE Wayland: prefer kwtype (uses KDE Fake Input protocol, supports umlauts)
         if is_kde_wayland() && is_kwtype_available() {
             info!("Using kwtype for direct text input on KDE Wayland");
             type_text_via_kwtype(text)?;
             return Ok(true);
         }
-        // Wayland: prefer wtype, then dotool, then ydotool
         // Note: wtype doesn't work on KDE (no zwp_virtual_keyboard_manager_v1 support)
         if !is_kde_wayland() && is_wtype_available() {
             info!("Using wtype for direct text input");
@@ -218,6 +225,23 @@ fn is_wl_copy_available() -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn is_remote_desktop_available() -> bool {
+    remote_desktop::is_available()
+}
+
+/// Type text directly via the Remote Desktop portal.
+#[cfg(target_os = "linux")]
+fn type_text_via_remote_desktop(text: &str) -> Result<(), String> {
+    match remote_desktop::send_type_text(text) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            warn!("Remote Desktop direct input failed: {}", err);
+            Err(format!("remote_desktop failed: {}", err))
+        }
+    }
 }
 
 /// Type text directly via wtype on Wayland.
