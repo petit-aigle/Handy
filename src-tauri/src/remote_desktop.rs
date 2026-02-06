@@ -5,6 +5,8 @@ use ashpd::desktop::PersistMode;
 #[cfg(target_os = "linux")]
 use ashpd::zbus::{self, zvariant::OwnedValue};
 #[cfg(target_os = "linux")]
+use unicode_normalization::UnicodeNormalization;
+#[cfg(target_os = "linux")]
 use log::{debug, warn};
 #[cfg(target_os = "linux")]
 use once_cell::sync::{Lazy, OnceCell};
@@ -269,17 +271,83 @@ fn keysym_for_char(ch: char) -> Option<u32> {
 async fn type_text_async(text: &str) -> Result<(), String> {
     let (proxy, session) = open_session_async(false).await?;
 
+    // Helper to send a press/release pair for a keysym.
+    async fn send_keysym(
+        proxy: &RemoteDesktop<'static>,
+        session: &ashpd::desktop::Session<'static, RemoteDesktop<'static>>,
+        keysym: u32,
+    ) -> Result<(), String> {
+        proxy
+            .notify_keyboard_keysym(session, keysym as i32, KeyState::Pressed)
+            .await
+            .map_err(|e| format!("Failed to send keysym press: {}", e))?;
+        proxy
+            .notify_keyboard_keysym(session, keysym as i32, KeyState::Released)
+            .await
+            .map_err(|e| format!("Failed to send keysym release: {}", e))
+    }
+
+    // Send a non-ASCII character through the Ctrl+Shift+U unicode input sequence to
+    // stay independent of the current keyboard layout.
+    async fn send_unicode_via_ctrl_shift_u(
+        proxy: &RemoteDesktop<'static>,
+        session: &ashpd::desktop::Session<'static, RemoteDesktop<'static>>,
+        ch: char,
+    ) -> Result<(), String> {
+        // Keysyms for modifiers and validation.
+        const XK_CONTROL_L: u32 = 0xFFE3;
+        const XK_SHIFT_L: u32 = 0xFFE1;
+        const XK_RETURN: u32 = 0xFF0D;
+        // 1) Press Control_L then Shift_L
+        proxy
+            .notify_keyboard_keysym(session, XK_CONTROL_L as i32, KeyState::Pressed)
+            .await
+            .map_err(|e| format!("unicode-input failed pressing Control: {e}"))?;
+        proxy
+            .notify_keyboard_keysym(session, XK_SHIFT_L as i32, KeyState::Pressed)
+            .await
+            .map_err(|e| format!("unicode-input failed pressing Shift: {e}"))?;
+        // 2) Press/Release 'u'
+        send_keysym(proxy, session, 'u' as u32).await?;
+        // 3) Release Shift_L then Control_L
+        proxy
+            .notify_keyboard_keysym(session, XK_SHIFT_L as i32, KeyState::Released)
+            .await
+            .map_err(|e| format!("unicode-input failed releasing Shift: {e}"))?;
+        proxy
+            .notify_keyboard_keysym(session, XK_CONTROL_L as i32, KeyState::Released)
+            .await
+            .map_err(|e| format!("unicode-input failed releasing Control: {e}"))?;
+
+        // 4) Send hex digits of the codepoint (lowercase).
+        let hex = format!("{:x}", ch as u32);
+        for (idx, digit) in hex.chars().enumerate() {
+            let keysym = keysym_for_char(digit)
+                .ok_or_else(|| format!("unicode-input: unsupported hex digit '{digit}'"))?;
+            send_keysym(proxy, session, keysym)
+                .await
+                .map_err(|e| format!("unicode-input failed at hex digit #{idx} '{digit}': {e}"))?;
+        }
+
+        // 5) Validate with Return.
+        send_keysym(proxy, session, XK_RETURN).await?;
+        // Give the portal a brief moment to exit the Ctrl+Shift+U compose state
+        // before the next character, to avoid the following key being swallowed.
+        tokio::time::sleep(Duration::from_millis(8)).await;
+        Ok(())
+    }
+
     let result = (|| async {
-        for ch in text.chars() {
-            let keysym = keysym_for_char(ch).ok_or_else(|| "Unsupported character".to_string())?;
-            proxy
-                .notify_keyboard_keysym(&session, keysym as i32, KeyState::Pressed)
-                .await
-                .map_err(|e| format!("Failed to send keysym press: {}", e))?;
-            proxy
-                .notify_keyboard_keysym(&session, keysym as i32, KeyState::Released)
-                .await
-                .map_err(|e| format!("Failed to send keysym release: {}", e))?;
+        // Normalize to NFC so we send precomposed characters (é, ô, …) as single keysyms.
+        let normalized = text.nfc().collect::<String>();
+        for ch in normalized.chars() {
+            if (ch as u32) > 0x7F {
+                send_unicode_via_ctrl_shift_u(&proxy, &session, ch).await?;
+            } else {
+                let keysym =
+                    keysym_for_char(ch).ok_or_else(|| "Unsupported character".to_string())?;
+                send_keysym(&proxy, &session, keysym).await?;
+            }
         }
         Ok(())
     })()
